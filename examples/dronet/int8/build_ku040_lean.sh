@@ -11,7 +11,7 @@
 #             with the imported reference packer; the network becomes one d_engine_s8 dispatch) ->
 #             scalar backend with kernels/scalar/scalar_d_engine_s8_riskybird_d.c (d_driver.h).
 #             D_SHAPE (default 16,16,4) must match the engine built into the bitstream (d_probe checks).
-#             D_BASE (default 0x12000000) is the engine's window base on the SoC.
+#             D_BASE (default 0x11000000, the integrator's RocketKU040LeanDConfig) is the engine window base.
 #
 # Zephyr target: stock chipyard_riscv64 + the HW integrator's lean overlay/conf (single hart, soft-float
 # kernel, -march=rv64imac -mabi=lp64). Outputs: $GEN and $SCHED next to $BUILD_DIR.
@@ -25,7 +25,7 @@ set -u
 : "${LEAN_CONF:=/scratch2/loren/soc-cache/p2goal/hw/zephyr/ku040_lean.conf}"
 : "${MODE:=cpu}"
 : "${D_SHAPE:=16,16,4}"
-: "${D_BASE:=0x12000000}"
+: "${D_BASE:=0x11000000}"
 : "${BUILD_DIR:=$MB/examples/dronet/int8/build/ku040_lean_$MODE}"
 : "${GEN:=${BUILD_DIR%/}.gen}"
 : "${SCHED:=${BUILD_DIR%/}.sched}"

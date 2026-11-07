@@ -25,6 +25,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("gen"); ap.add_argument("backend"); ap.add_argument("golden"); ap.add_argument("out")
     ap.add_argument("--ops", default=None)
+    ap.add_argument("--repeat", type=int, default=1,
+                    help="run each dispatch N times (state carried over, e.g. a loaded accelerator)")
     a = ap.parse_args()
     g = json.load(open(os.path.join(a.gen, "graph.json")))
     man = json.load(open(os.path.join(a.golden, "tensors", "manifest.json")))
@@ -111,8 +113,11 @@ def main():
         L.append(f"static const int8_t g_{c_ident(k)}[{len(data)}] = {{" + ",".join(str(b - 256 if b > 127 else b) for b in data) + "};")
     L += [f"extern const model_{mid}_dispatch_fn MODEL_{mid.upper()}_DISPATCH_FNS[];", "int main(void) {",
           f"    model_{mid}_state_t s; memset(&s, 0, sizeof s);",
-          "    s.input = (void *)g_input; s.output = (void *)g_output;", "    int fails = 0, n = 0;"]
-    for d, name, k, cin, couts in rows:
+          "    s.input = (void *)g_input; s.output = (void *)g_output;", "    int fails = 0, n = 0;",
+          f"#ifdef MODEL_{mid.upper()}_HAS_INIT",
+          f"    model_{mid}_init();   /* one-time setup, as the xpurt runtime does before timing */",
+          "#endif"]
+    for d, name, k, cin, couts in [r for r in rows for _ in range(a.repeat)]:
         for p, b, _ in cin:
             L.append(f"    memcpy({p}, {b}, sizeof {b});")
         for op, gb, n in couts:
