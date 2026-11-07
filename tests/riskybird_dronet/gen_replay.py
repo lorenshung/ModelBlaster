@@ -33,7 +33,7 @@ def main():
         gold.setdefault(t.get("graph_tensor") or t["name"], t)
         gold.setdefault(t["name"], t)
     tensors = g["tensors"]; mid = c_ident(g["name"])
-    alias = {o["outputs"][0]: o["inputs"][0] for o in g["ops"] if o["op"] == "view"}
+    alias = {o["outputs"][0]: o["inputs"][0] for o in g["ops"] if o["op"] == "view" or o.get("elided")}
     def res(t):
         while t in alias: t = alias[t]
         return t
@@ -61,6 +61,8 @@ def main():
         if r != t and len(sh) == 2:          # a flatten view: the 4-D tensor's order
             t, meta, sh = r, tensors.get(r, {}), tensors.get(r, {}).get("shape") or []
         gm = gold.get(t)
+        if gm is None and t.endswith(".nhwc"):   # an island boundary copy of tensor <t>
+            gm = gold.get(t[:-5])
         if gm is None and r != t:            # a layout alias (assign_layouts --alias-c1)
             t, meta, sh = r, tensors.get(r, {}), tensors.get(r, {}).get("shape") or []
             gm = gold.get(t)
@@ -84,7 +86,7 @@ def main():
         return "g_" + c_ident(key)
     for o in g["ops"]:
         d = o.get("dispatch_id")
-        if d is None: continue
+        if d is None or o.get("elided"): continue
         k = o["op"]
         if (sel is not None and k not in sel) or k in skip: continue
         gi = [golden_for(t) for t in o["inputs"]]

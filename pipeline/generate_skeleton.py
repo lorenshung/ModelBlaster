@@ -2330,7 +2330,9 @@ def emit_model(ir: dict[str, Any], out_dir: str,
             name = aliases[name]
         return name
     for op in ir["ops"]:
-        if op["op"] == "view":
+        if op["op"] == "view" or op.get("elided"):
+            # An elided relayout (assign_layouts --elide-relayouts) is a
+            # dispatch with no body whose output is its input's buffer.
             aliases[op["outputs"][0]] = op["inputs"][0]
         elif op["op"] in ("chunk2_c1", "chunk2_c1_f16", "chunk2_c1_s8"):
             # Two outputs: first half at offset 0, second half at offset
@@ -2750,6 +2752,25 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         if op["op"] in _zero_cost_ops:
             # view / chunk2_c1: no kernel call. Aliases were set up above
             # (plain aliases for view, offset aliases for chunk2_c1).
+            continue
+        if op.get("elided"):
+            # Kept only so the dispatch list (and so the schedule) matches a
+            # graph that still had this relayout; the data never moves.
+            dispatch_id = op["dispatch_id"]
+            dispatch_fns.append(
+                f"static void dispatch_{mid}_{dispatch_id}(model_{mid}_state_t *s) {{\n"
+                f"    unsigned long _s = rdcycle();\n"
+                f"    (void)s; /* elided {op['op']}: the consumer reads this layout directly */\n"
+                f"    unsigned long _e = rdcycle();\n"
+                f"    int slot = (n_++) % MODEL_{umid}_OP_COUNT;\n"
+                f'    records_[slot].dispatch_id = {dispatch_id};\n'
+                f'    records_[slot].name   = "{op["name"]}";\n'
+                f'    records_[slot].op     = "{op["op"]}";\n'
+                f'    records_[slot].shape  = "{_shape_str(op)}";\n'
+                f"    records_[slot].cycles = _e - _s;\n"
+                f"}}"
+            )
+            invoke_table_rows.append(f"    dispatch_{mid}_{dispatch_id},")
             continue
         if op["op"].startswith("__fused__"):
             # axis-C realization (see pipeline/apply_fusion_hint.py).
