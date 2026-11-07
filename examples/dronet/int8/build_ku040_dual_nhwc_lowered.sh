@@ -163,5 +163,11 @@ west build -p always -b chipyard_riscv64 harness_xpurt --build-dir "$BUILD_DIR" 
   -DEXTRA_DTC_OVERLAY_FILE="$CONSOLE_OVERLAY"
 rc=$?
 rm -f "$SOFTFLOAT_CONF"
+if [ $rc = 0 ]; then
+  # Hart 1 (Rocket + Gemmini) has no vector unit: nothing it can run may contain RVV instructions.
+  python tests/riskybird_dronet/check_hart_isa.py "$BUILD_DIR/zephyr/zephyr.elf" \
+      "$SCHED/ku040_dronet_nhwc_dev.c" --hart 1 \
+      --objdump "$ZEPHYR_SDK/gnu/riscv64-zephyr-elf/bin/riscv64-zephyr-elf-objdump" || rc=3
+fi
 echo "build rc=$rc  elf=$BUILD_DIR/zephyr/zephyr.elf"
 exit $rc

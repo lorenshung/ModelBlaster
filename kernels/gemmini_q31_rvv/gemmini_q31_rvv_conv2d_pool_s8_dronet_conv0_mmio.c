@@ -44,6 +44,25 @@
 
 #define C0_USE_DMA 0
 
+/* Scalar ISA only. This file lands in gemmini_q31_rvv's kernels.c, which is compiled with
+ * -march=..._zve64x because other kernels in that TU use RVV intrinsics, but the hart that runs it
+ * (hart 1: Rocket + Gemmini) has NO vector unit. GCC auto-vectorizes the copy loops and expands the
+ * 8-byte memcpy with vle8/vse8 (seen on the board: illegal instruction, vsetivli, in the MMIO path).
+ * -fno-tree-vectorize does not stop the memcpy expansion, so every function here is compiled for the
+ * scalar ISA of the ABI in use. build_ku040_dual_nhwc_lowered.sh checks the linked result with
+ * tests/riskybird_dronet/check_hart_isa.py. */
+#if defined(__riscv)
+#if defined(__riscv_float_abi_double)
+#define C0_FN __attribute__((target("arch=rv64imafdc")))
+#elif defined(__riscv_float_abi_single)
+#define C0_FN __attribute__((target("arch=rv64imafc")))
+#else
+#define C0_FN __attribute__((target("arch=rv64imac")))
+#endif
+#else
+#define C0_FN
+#endif
+
 unsigned long long c0_engine_cycles, c0_id;
 unsigned long long c0_dma_id, c0_dma_in_cycles, c0_dma_out_cycles, c0_dma_status;
 unsigned long long c0_calls, c0_fallbacks;
@@ -52,7 +71,7 @@ unsigned long long c0_calls, c0_fallbacks;
 /* ---------------- functional model of the device ---------------- */
 static uint8_t c0m_win[0x10000];
 static uint64_t c0m_status, c0m_cycles, c0m_dma_ext, c0m_dma_loc, c0m_dma_len, c0m_dma_status, c0m_dma_cycles;
-static void c0m_engine(void) {
+C0_FN static void c0m_engine(void) {
     const int8_t *img = (const int8_t *)c0m_win;
     const uint64_t prm = *(const uint64_t *)(c0m_win + 0xF018);
     const int64_t mult = (int64_t)(prm & 0x7FFFFFFF);
@@ -90,7 +109,7 @@ static void c0m_engine(void) {
     c0m_cycles = 27243;     /* the RTL's count (xsim, Verilator, board) */
     c0m_status = 2;
 }
-static void c0m_dma_go(uint64_t ctrl) {
+C0_FN static void c0m_dma_go(uint64_t ctrl) {
     const uint64_t ext = c0m_dma_ext, loc = c0m_dma_loc, len = c0m_dma_len;
     if ((ext | loc | len) & 7 || len == 0 || loc + len > 0xF000) { c0m_dma_status = 2 | 4; return; }
     if (ctrl & 2) memcpy((void *)(uintptr_t)ext, c0m_win + loc, len);
@@ -98,7 +117,7 @@ static void c0m_dma_go(uint64_t ctrl) {
     c0m_dma_cycles = len / 8;
     c0m_dma_status = 2;
 }
-static inline void c0_w64(unsigned off, unsigned long long v) {
+C0_FN static inline void c0_w64(unsigned off, unsigned long long v) {
     switch (off) {
     case 0xF008: if (v & 1) c0m_engine(); return;
 #if !defined(MB_DRONET_CONV0_MODEL_NO_DMA)
@@ -110,7 +129,7 @@ static inline void c0_w64(unsigned off, unsigned long long v) {
     default: memcpy(c0m_win + off, &v, 8);
     }
 }
-static inline unsigned long long c0_r64(unsigned off) {
+C0_FN static inline unsigned long long c0_r64(unsigned off) {
     uint64_t v;
     switch (off) {
     case 0xF000: return 0x00000001434E5244ULL;
@@ -130,15 +149,15 @@ static inline unsigned long long c0_r64(unsigned off) {
 #else
 /* ---------------- the device ---------------- */
 #define C0_BASE 0x11000000UL
-static inline void c0_w64(unsigned off, unsigned long long v) { *(volatile unsigned long long *)(C0_BASE + off) = v; }
-static inline unsigned long long c0_r64(unsigned off) { return *(volatile unsigned long long *)(C0_BASE + off); }
+C0_FN static inline void c0_w64(unsigned off, unsigned long long v) { *(volatile unsigned long long *)(C0_BASE + off) = v; }
+C0_FN static inline unsigned long long c0_r64(unsigned off) { return *(volatile unsigned long long *)(C0_BASE + off); }
 #define C0_FENCE() __asm__ volatile("fence" ::: "memory")
 #endif
 
 /* Scalar NHWC conv + maxpool for everything the engine cannot take. HWIO weights
  * (gemmini_q31_rvv packing: w[((kh*KW + kw)*IC + ic)*OC + oc]); requantize then pool,
  * exactly as CONV2D_POOL_S8.reference_impl, out-of-bounds pool taps ignored. */
-static void c0_fallback(const int8_t *input, const int8_t *weight, const int32_t *bias, int8_t *output,
+C0_FN static void c0_fallback(const int8_t *input, const int8_t *weight, const int32_t *bias, int8_t *output,
                         int N, int IC, int IH, int IW, int OC, int KH, int KW, int SH, int SW, int PH, int PW,
                         int in_off, int f_off, int out_off, int mult, int shift, int amin, int amax,
                         int pKH, int pKW, int pSH, int pSW, int pPH, int pPW, int pDH, int pDW) {
@@ -191,7 +210,7 @@ static int c0_has_dma;
 
 #if C0_USE_DMA
 /* One DMA transfer; 0 on success, -1 if the device flagged an argument error. */
-static int c0_dma(unsigned long ext, unsigned loc, unsigned len, int to_mem, unsigned long long *cyc) {
+C0_FN static int c0_dma(unsigned long ext, unsigned loc, unsigned len, int to_mem, unsigned long long *cyc) {
     C0_FENCE();
     c0_w64(0xF100, ext); c0_w64(0xF108, loc); c0_w64(0xF110, len);
     c0_w64(0xF118, 1 | (to_mem ? 2 : 0));
@@ -202,7 +221,7 @@ static int c0_dma(unsigned long ext, unsigned loc, unsigned len, int to_mem, uns
 }
 #endif
 
-void kernel_conv2d_pool_s8(const int8_t *input, const int8_t *weight,
+C0_FN void kernel_conv2d_pool_s8(const int8_t *input, const int8_t *weight,
                            const int32_t *bias, int8_t *output,
                            int N, int IC, int IH, int IW, int OC,
                            int KH, int KW, int SH, int SW, int PH, int PW,

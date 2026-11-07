@@ -10,6 +10,11 @@
  *         register-level model of B + its DMA, for off-board verification. */
 #include <stdint.h>
 #include <stddef.h>
+/* Hart 1 has no vector unit but this TU is compiled with zve64x (see the conv0 driver): no
+ * auto-vectorization in the driver or these wrappers. b_driver.h is a verbatim import, so the
+ * region is set here; check_hart_isa.py verifies the linked result. */
+#pragma GCC push_options
+#pragma GCC optimize("no-tree-vectorize")
 #include "b_driver.h"
 
 #ifndef RB_B_READY_DEFINED   /* one flag per TU, whichever B kernel comes first */
@@ -38,3 +43,4 @@ void kernel_batchnorm2d_q_s8(const int8_t *input, const int32_t *M,
             }
         }
 }
+#pragma GCC pop_options
