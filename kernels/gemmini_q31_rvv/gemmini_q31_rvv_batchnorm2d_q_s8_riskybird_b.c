@@ -23,7 +23,7 @@ void kernel_batchnorm2d_q_s8(const int8_t *input, const int32_t *M,
                              int activation_min, int activation_max) {
     if (!b_ready_) { b_init(); b_ready_ = 1; }
     if (inner == 1 && C <= 256) {
-        int32_t B[256];
+        static int32_t B[256];   /* not on the worker's stack; B has one owner hart */
         for (int c = 0; c < C; c++) B[c] = BP[c] - ((int32_t)1 << (S[c] - 1));
         b_bn_nhwc(input, output, outer, C, M, B, BP, S, activation_min, activation_max);
         return;
