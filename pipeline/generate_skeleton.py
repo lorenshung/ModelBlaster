@@ -2120,6 +2120,14 @@ def emit_weights(
     if tile_extra:
         weights = {**{k: v for k, v in weights.items() if k not in tile_drop},
                    **tile_extra}
+    # K-axis permutation for linears that read an NHWC tensor through a flatten
+    # (assign_layouts --flatten-into-linear sets op["weight_perm"]). Applied to
+    # the logical [N, K] array before any backend packing, so every backend's
+    # weights.c agrees: the activation is one buffer shared by all of them.
+    perms = _linear_weight_perms(ir)
+    if perms:
+        weights = {k: (_apply_linear_weight_perm(v, perms[k]) if k in perms else v)
+                   for k, v in weights.items()}
     keys = sorted(weights.keys())
     h_lines = [HEADER, "#pragma once", "",
                "#include <stdint.h>",
@@ -2160,6 +2168,45 @@ def emit_weights(
         c_lines.append("")
     with open(os.path.join(out_dir, "weights.c"), "w") as f:
         f.write("\n".join(c_lines))
+
+
+def _linear_weight_perms(ir: Optional[dict[str, Any]]) -> dict[str, dict]:
+    """weight key -> weight_perm, for every linear op carrying one.
+
+    A weight shared by ops that disagree is refused rather than packed one way.
+    """
+    perms: dict[str, dict] = {}
+    if not ir:
+        return perms
+    plain: set[str] = set()
+    for op in ir.get("ops", []) or []:
+        k = op.get("weight")
+        if not k:
+            continue
+        p = op.get("weight_perm")
+        if p is None:
+            plain.add(k)
+            continue
+        if p.get("kind") != "nhwc_flatten":
+            raise SystemExit(f"{op.get('name')}: unknown weight_perm {p!r}")
+        if k in perms and perms[k] != p:
+            raise SystemExit(f"weight {k!r}: conflicting weight_perm across ops")
+        perms[k] = p
+    both = plain & set(perms)
+    if both:
+        raise SystemExit(f"weights {sorted(both)} are read both permuted and "
+                         f"unpermuted; give the ops separate weight tensors")
+    return perms
+
+
+def _apply_linear_weight_perm(w: np.ndarray, p: dict) -> np.ndarray:
+    """[N, C*H*W] in NCHW-flatten order -> [N, H*W*C] in NHWC-flatten order:
+    w'[n, (h*W + w)*C + c] = w[n, (c*H + h)*W + w]."""
+    C, H, W = int(p["C"]), int(p["H"]), int(p["W"])
+    if w.ndim != 2 or w.shape[1] != C * H * W:
+        raise SystemExit(f"weight_perm {p!r} does not fit a weight of shape {w.shape}")
+    return np.ascontiguousarray(
+        w.reshape(w.shape[0], C, H, W).transpose(0, 2, 3, 1).reshape(w.shape[0], -1))
 
 
 def _shape_str(op: dict) -> str:
@@ -3587,6 +3634,40 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"kernel_add_s8({a_ptr}, {b_ptr}, {out_ptr}, {n}, "
                 f"{_f32(q['scale_a'])}, {_f32(q['scale_b'])}, "
                 f"{_f32(q['scale_out'])}, "
+                f"{q['activation_min']}, {q['activation_max']})"
+            )
+        elif op["op"] == "add_q_s8":
+            a_ptr = ptr_for(op["inputs"][0], "in")
+            b_ptr = ptr_for(op["inputs"][1], "in")
+            n = op["shape"]["n"]
+            q = op["quant"]
+            call = (
+                f"kernel_add_q_s8({a_ptr}, {b_ptr}, {out_ptr}, {n}, "
+                f"{q['ma']}, {q['mb']}, {q['shift']}, "
+                f"{q['activation_min']}, {q['activation_max']})"
+            )
+        elif op["op"] == "batchnorm2d_q_s8":
+            # (outer, C, inner) from the DECLARED layout of the activation; the
+            # kernel indexes ((o*C + c)*inner + i), so this is the only place
+            # the axis order enters. Input and output must agree.
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            _lays = _actlay.op_layouts(ir, op)
+            if len(_lays) != 1:
+                raise SystemExit(f"{op.get('name')}: batchnorm2d_q_s8 mixes "
+                                 f"layouts {sorted(_lays)}")
+            sh = op["shape"]
+            q = op["quant"]
+            fw = op["fold_weights"]
+            if next(iter(_lays)) == _actlay.NHWC:
+                outer, inner = sh["N"] * sh["H"] * sh["W"], 1
+            else:
+                outer, inner = sh["N"], sh["H"] * sh["W"]
+            call = (
+                f"kernel_batchnorm2d_q_s8({in_ptr}, "
+                f"{_weight_name(model_name, fw['m'], backend)}, "
+                f"{_weight_name(model_name, fw['bp'], backend)}, "
+                f"{_weight_name(model_name, fw['s'], backend)}, {out_ptr}, "
+                f"{outer}, {sh['C']}, {inner}, "
                 f"{q['activation_min']}, {q['activation_max']})"
             )
         elif op["op"] == "batchnorm2d_s8":
