@@ -17,7 +17,9 @@ case $BK in
   *) KF="" ;;
 esac
 F="-march=rv64gcv -mabi=lp64d -mcmodel=medany -O2 -ffp-contract=off -isystem $RT/riscv64-unknown-elf/include -I$H/stub -I$D $KF ${CFLAGS_EXTRA:-}"
+F="$F -isystem $MB/kernels/riskybird"
 for s in model kernels weights buffers; do $CC14 $F -c $D/$s.c -o $O/$s.o; done
+for x in ${EXTRA_SRCS:-}; do $CC14 $F -c $x -o $O/extra_$(basename $x .c).o; done
 $CC14 $F -c $O/replay.c -o $O/replay.o
 $RT/bin/riscv64-unknown-elf-gcc -march=rv64gcv -mabi=lp64d -mcmodel=medany -specs=htif_nano.specs -static \
   -T /scratch2/loren/riskybird-dev/backends/chipyard/tests/htif.ld $O/*.o -lm -o $O/replay.riscv

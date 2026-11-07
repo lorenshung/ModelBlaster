@@ -22,6 +22,9 @@
 #                    none  Gemmini tiled_conv_pool_nhwc (default)
 #                    mmio  RiskyBird conv0 engine, CPU copies over MMIO (dronet_conv0_mmio)
 #                    dma   conv0 engine + its DMA, MMIO fallback when no DMA (dronet_conv0_dma)
+#   ACCEL_B=1      batchnorm2d_q_s8 and add_q_s8 on the RiskyBird B unit (riskybird_b, needs
+#                  LOWER_SW=1|keep), and those dispatches move to hart 1 (B's owner hart; the
+#                  schedule entries become gemmini_q31 in core_kind AND impl). relu stays on hart 0.
 #   FOLD_REQUIRE_EXACT=1  refuse the fold if any folded op differs from its float reference
 #                  anywhere in the int8 input domain (true for DroNet; see the fold log).
 #
@@ -41,6 +44,7 @@ set -u
 : "${BUILD_DIR:=$MB/examples/dronet/int8/build/ku040_dronet_nhwc_lowered}"
 : "${LOWER_SW:=1}"
 : "${ACCEL:=none}"
+: "${ACCEL_B:=0}"
 : "${FOLD_REQUIRE_EXACT:=1}"
 : "${GEN:=${BUILD_DIR%/}.gen}"
 : "${SCHED:=${BUILD_DIR%/}.sched}"
@@ -52,6 +56,11 @@ case "$ACCEL" in
   dma)  PIN=(--pin-algorithm conv2d_pool_s8=dronet_conv0_dma) ;;
   *) echo "ACCEL must be none|mmio|dma, got '$ACCEL'"; exit 2 ;;
 esac
+if [ "$ACCEL_B" = "1" ]; then
+  [ "$LOWER_SW" = "0" ] && { echo "ACCEL_B=1 needs LOWER_SW=1|keep (B runs the folded ops)"; exit 2; }
+  PIN+=(--pin-algorithm batchnorm2d_q_s8=riskybird_b --pin-algorithm add_q_s8=riskybird_b)
+fi
+export ACCEL_B
 
 source "$CONDA_SH"; conda activate "$CONDA_ENV"
 export ZEPHYR_BASE="$ZCS/zephyr_ws/zephyr"
@@ -112,6 +121,9 @@ g=json.load(open(sys.argv[1])); opk={o.get("dispatch_id"):o.get("op") for o in g
 S=json.load(open(sys.argv[2]))
 # Same placement rule as build_ku040_dual_nhwc.sh: Gemmini-side kinds -> hart1, the rest -> hart0.
 GEM={"conv2d_s8","conv2d_pool_s8","nchw_to_nhwc_s8","nhwc_to_nchw_s8"}
+import os
+if os.environ.get("ACCEL_B") == "1":
+    GEM |= {"batchnorm2d_q_s8","add_q_s8"}   # B's owner hart; relu_s8 stays on hart 0
 for k,v in S["dispatches"].items():
     v.pop("impl",None)
     v["hardware_target"]="CPU_P#0" if opk.get(v.get("id")) in GEM else "CPU_E#0"
@@ -139,7 +151,7 @@ CONFIG_MP_MAX_NUM_CPUS=2
 CONFIG_RV_BOOT_HART=0
 CONF
 PC=$MB/cores/gemmini/include/per_config/$GEMMINI_CONFIG
-GCF="-march=rv64imac_zve64x;-mabi=lp64;-isystem$PC;-isystem$MB/cores/gemmini/include;-isystem$MB/cores/gemmini;-isystem$MB/kernels/gemmini_q31_rvv;-DGEMMINI_ROCC;-DBAREMETAL;-DMODELBLASTER_GEMMINI_HWIO_WEIGHTS=1;-DMODELBLASTER_GEMMINI_Q31_ACC_SCALE=1"
+GCF="-march=rv64imac_zve64x;-mabi=lp64;-isystem$PC;-isystem$MB/cores/gemmini/include;-isystem$MB/cores/gemmini;-isystem$MB/kernels/gemmini_q31_rvv;-isystem$MB/kernels/riskybird;-DGEMMINI_ROCC;-DBAREMETAL;-DMODELBLASTER_GEMMINI_HWIO_WEIGHTS=1;-DMODELBLASTER_GEMMINI_Q31_ACC_SCALE=1"
 RCF="-march=rv64imac_zve64x;-mabi=lp64;-DMODELBLASTER_RVV_IHWOC_WEIGHTS=1"
 echo "== west build -> $BUILD_DIR =="
 west build -p always -b chipyard_riscv64 harness_xpurt --build-dir "$BUILD_DIR" -- \

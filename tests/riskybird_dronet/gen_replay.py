@@ -115,6 +115,7 @@ def main():
             L.append(f"    memcpy({p}, {b}, sizeof {b});")
         L.append(f"    memset({op}, 0x5a, {n});")
         L.append(f"    MODEL_{mid.upper()}_DISPATCH_FNS[{d}](&s);")
+        L.append(f"#ifdef REPLAY_AFTER_HOOK\n    {{ extern void replay_after(int); replay_after({d}); }}\n#endif")
         L.append(f"    {{ int bad = 0; for (int i = 0; i < {n}; i++) bad += ((int8_t *){op})[i] != {gb}[i]; n++; fails += bad != 0;"
                  f' printf("dispatch %2d %-16s %-18s %6d bytes: %s (%d differ)\\n", {d}, "{name}", "{k}", {n}, bad ? "DIFFER" : "IDENTICAL", bad); }}')
     L += ['    printf("REPLAY %s: %d/%d dispatches byte-identical to golden\\n", fails ? "FAIL" : "PASS", n - fails, n);',

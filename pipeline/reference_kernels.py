@@ -13219,6 +13219,25 @@ for _name, _desc in (
 del _name, _desc
 
 
+# ── Accelerator lowering: RiskyBird B unit (streaming BN / add / activation) ─
+# soc/phase2/b_unit/CONTRACT.md v1; driver kernels/riskybird/b_driver.h (imported
+# verbatim), register-level host model kernels/riskybird/b_model.c (-DB_HOST_MODEL).
+# Same integer numerics as the folded ops' reference_impl; anything B refuses
+# (unaligned, C not a power of two, constants out of range, NCHW) runs the
+# scalar fallback in the driver. Selected with --pin-algorithm OP=riskybird_b on
+# the backend whose hart owns B (the recipe places BN/add on hart 1).
+for _spec in (BATCHNORM2D_Q_S8, ADD_Q_S8):
+    _spec.algorithms.append(AlgorithmCandidate(
+        name="riskybird_b",
+        target_affinity=GEMMINI_TARGETS,
+        accuracy_class=AccuracyClass.BIT_EXACT,
+        description=("RiskyBird B unit through b_driver.h (DMA in, compute on write, DMA "
+                     "out); scalar fallback for what B cannot take."),
+        reference_impl="",
+    ))
+del _spec
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     'linear': LINEAR,
     'matmul': MATMUL,
