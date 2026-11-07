@@ -1568,6 +1568,11 @@ def generate(
     # a curated kernel exists for them. The consumer of XPU-RT's
     # `choose_implementation` advice -- see `keep_reference_ops` below.
     keep_reference_ops: Optional[set[str]] = None,
+    # op kind -> algorithm name. The reference path probes ONLY that algorithm
+    # for the op and fails the run if no source supplies it. This is how an
+    # accelerator lowering is selected (e.g. conv2d_pool_s8=dronet_conv0_dma):
+    # first-found-wins would otherwise keep the algorithm listed first.
+    pin_algorithms: Optional[dict[str, str]] = None,
     # Opt-in: after the spike beam search picks a best, re-rank the
     # top-K spike survivors on FireSim RTL. The cache slot is replaced
     # with the firesim-best only if the firesim cycles drop by >=
@@ -1763,7 +1768,11 @@ def generate(
                     # Already swapped by an earlier source (cache beats
                     # global_curated, since cache was vetted for THIS model).
                     continue
-                for algorithm in spec.algorithms:
+                _algos = spec.algorithms
+                if pin_algorithms and spec.op in pin_algorithms:
+                    _algos = [a for a in spec.algorithms
+                              if a.name == pin_algorithms[spec.op]]
+                for algorithm in _algos:
                     candidate_path = path_layout(spec, algorithm)
                     if not candidate_path or not os.path.exists(candidate_path):
                         continue
@@ -1929,6 +1938,17 @@ def generate(
         # BACKEND=llm run). Files at <cache_dir>/<target>_<op>_<algo>.c
         # — note the flat layout (no <target>/ subdir) since cache_dir
         # is already per-target.
+        if pin_algorithms:
+            _known = {sp.op: {a.name for a in sp.algorithms} for sp in specs}
+            for _op, _al in pin_algorithms.items():
+                if _op not in _known:
+                    raise SystemExit(f"--pin-algorithm {_op}={_al}: this model has "
+                                     f"no {_op} op")
+                if _al not in _known[_op]:
+                    raise SystemExit(f"--pin-algorithm {_op}={_al}: unknown algorithm; "
+                                     f"{_op} has {sorted(_known[_op])}")
+                curated_seed.pop(_op, None)
+                impls[_op] = next(sp for sp in specs if sp.op == _op).reference_impl
         _probe_swap(
             "cache",
             cache_dir,
@@ -1961,6 +1981,14 @@ def generate(
                     f"{_a}_{spec.op}_{algorithm.name}.c",
                 ) if global_curated_dir else None,
             )
+        for _op, _al in (pin_algorithms or {}).items():
+            if kernel_picks.get(_op, {}).get("algorithm") != _al:
+                raise SystemExit(
+                    f"--pin-algorithm {_op}={_al}: no curated or cached source "
+                    f"for target {target.name} was accepted (looked for "
+                    f"{target.name}_{_op}_{_al}.c along the curated lineage)")
+            kernel_picks[_op]["pinned"] = True
+            log(f"  [{_op}] pinned to algorithm {_al}")
     elif backend_name == "llm":
         # Lazy proxy: the LLM client is only instantiated when actually needed
         # for LLM inference. Curated/cached kernel hits skip LLM entirely, so
@@ -2336,6 +2364,12 @@ def main() -> None:
                          "turns the advice into this list. The advised timing "
                          "was measured in a different BUILD, so the change has "
                          "to be re-profiled, not assumed.")
+    ap.add_argument("--pin-algorithm", action="append", default=[],
+                    metavar="OP=ALGO",
+                    help="reference backend: use exactly this curated algorithm "
+                         "for this op kind, or fail (repeatable). Selects an "
+                         "accelerator lowering, e.g. "
+                         "conv2d_pool_s8=dronet_conv0_dma.")
     ap.add_argument("--algorithms", default="all",
                     help=("comma-separated algorithm names to try (in order) "
                           "for each op, or 'all' (default) to try every "
@@ -2416,6 +2450,8 @@ def main() -> None:
         firesim_top_k=args.firesim_top_k,
         cache_aware_prompt=args.cache_aware_prompt,
         firesim_op_filter=firesim_op_filter,
+        pin_algorithms=(dict(p.split("=", 1) for p in args.pin_algorithm)
+                        if args.pin_algorithm else None),
     )
 
 

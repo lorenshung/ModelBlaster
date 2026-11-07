@@ -56,7 +56,9 @@ NHWC_CAPABLE: set[str] = {"conv2d_s8", "maxpool2d_s8", "conv2d_pool_s8"}  # bn d
 #: Layout-agnostic: pure elementwise, same bytes in any order, so they never
 #: force a conversion and never need a variant. They join an island for free.
 LAYOUT_AGNOSTIC = {"add_s8", "relu_s8", "mul_s8", "sigmoid_s8", "silu_s8",
-                   "relu6_s8", "gelu_s8", "add_f16", "relu_f16", "mul_f16"}
+                   "relu6_s8", "gelu_s8", "add_f16", "relu_f16", "mul_f16",
+                   # fold_quant_consts.py outputs; see act_layout.LAYOUT_AGNOSTIC_OPS
+                   "add_q_s8", "batchnorm2d_q_s8"}
 
 #: Ops that must never be inside an island even though they look harmless.
 #: `view` is a codegen alias and stays layout-preserving -- but the thing it
@@ -163,8 +165,81 @@ def _islands(ir, ops):
     return sorted(out)
 
 
-def assign_islands(graph: dict[str, Any]) -> dict[str, Any]:
-    """Rewrite `graph`: mark island tensors nhwc and insert boundary relayouts."""
+def _flatten_absorb(out, t, consumers, island_ids, out_names):
+    """Can the island's NHWC output `t` feed its flatten -> ... -> linear tail
+    directly, with the linears' weights permuted instead of a relayout?
+
+    Returns (linear_ops, closure_tensors) or None. The walk starts at the view
+    ops that read `t` and follows views and layout-agnostic elementwise ops;
+    every path must end at a linear_s8 (or linear_s8_pc) that reads the flat
+    vector as its activation. A flatten is a reinterpretation, so under NHWC
+    the linear sees element order (h, w, c) instead of (c, h, w); permuting the
+    linear's K axis to match is exact (an integer dot product reordered).
+    Refused when: `t` is not 4-D, anything on the way is a model output (the
+    host would read it in the wrong order), a non-agnostic op reads it, or a
+    linear's weight is shared with a linear outside the tail.
+    """
+    tensors = out["tensors"]
+    sh = list((tensors.get(t) or {}).get("shape") or [])
+    if len(sh) != 4:
+        return None
+    _, C, H, W = (int(v) for v in sh)
+    linears, closure, stack = [], set(), []
+    for c in consumers.get(t, []):
+        if c.get("dispatch_id") in island_ids:
+            continue
+        if c.get("op") != "view":
+            return None
+        stack.append(c)
+    if not stack:
+        return None
+    seen = set()
+    while stack:
+        o = stack.pop()
+        if id(o) in seen:
+            continue
+        seen.add(id(o))
+        kind = o.get("op")
+        if kind in ("linear_s8", "linear_s8_pc"):
+            if (o.get("inputs") or [None])[0] not in closure:
+                return None
+            sh_l = o.get("shape") or {}
+            if int(sh_l.get("K", -1)) != C * H * W:
+                return None
+            linears.append(o)
+            continue
+        if kind != "view" and kind not in LAYOUT_AGNOSTIC:
+            return None
+        if kind != "view" and len(o.get("inputs") or []) != 1:
+            return None
+        for ot in (o.get("outputs") or []):
+            if ot in out_names:
+                return None
+            closure.add(ot)
+            for c in consumers.get(ot, []):
+                stack.append(c)
+    if not linears:
+        return None
+    wkeys = {o.get("weight") for o in linears}
+    lin_ids = {id(o) for o in linears}
+    for o in out["ops"]:
+        if o.get("weight") in wkeys and id(o) not in lin_ids:
+            return None
+    return linears, closure, (C, H, W)
+
+
+def assign_islands(graph: dict[str, Any], alias_c1: bool = False,
+                   flatten_into_linear: bool = False) -> dict[str, Any]:
+    """Rewrite `graph`: mark island tensors nhwc and insert boundary relayouts.
+
+    alias_c1: a boundary tensor with C == 1 (or H*W == 1) has the same bytes in
+        NCHW and NHWC, so its relayout becomes a zero-cost `view` alias instead
+        of a dispatch.
+    flatten_into_linear: an island output whose only outside readers are a
+        flatten -> (elementwise)* -> linear tail stays NHWC; the linears get a
+        `weight_perm` that generate_skeleton.emit_weights applies to their K
+        axis, so no tail relayout is emitted (see _flatten_absorb).
+    """
     out = copy.deepcopy(graph)
     tensors = out.setdefault("tensors", {})
     ops = [o for o in out["ops"] if o.get("dispatch_id") is not None]
@@ -212,10 +287,23 @@ def assign_islands(graph: dict[str, Any]) -> dict[str, Any]:
     # downstream consumer -- including the codegen's view aliases and the output
     # surface -- is untouched.
     tail_src: dict[str, str] = {}     # original tensor -> nhwc tensor
+    n_absorbed = 0
     for d in sorted(island_ids):
         for t in (by_id[d].get("outputs") or []):
             outside = [c for c in consumers.get(t, [])
                        if c.get("dispatch_id") not in island_ids]
+            if outside and flatten_into_linear and t not in out_names:
+                ab = _flatten_absorb(out, t, consumers, island_ids, out_names)
+                if ab is not None:
+                    linears, closure, (C, H, W) = ab
+                    for lo in linears:
+                        lo["weight_perm"] = {"kind": "nhwc_flatten",
+                                             "C": C, "H": H, "W": W}
+                    for ct in closure:
+                        tensors[ct]["flat_order"] = "nhwc"
+                    tensors[t]["layout"] = "nhwc"
+                    n_absorbed += 1
+                    continue
             if outside or t in out_names:
                 tail_src[t] = f"{t}.nhwc"
 
@@ -228,6 +316,12 @@ def assign_islands(graph: dict[str, Any]) -> dict[str, Any]:
 
     def _relayout_op(kind, src, dst, shape_src, name):
         sh = list(tensors[shape_src]["shape"])
+        if alias_c1 and (int(sh[1]) == 1 or int(sh[2]) * int(sh[3]) == 1):
+            # Same bytes in both layouts: a zero-cost alias, never a dispatch.
+            return {"op": "view", "name": name, "inputs": [src],
+                    "outputs": [dst], "dispatch_id": None,
+                    "hardware_target": "any", "layout_boundary": True,
+                    "layout_alias": True}
         return {"op": kind, "name": name, "inputs": [src], "outputs": [dst],
                 "dispatch_id": -1,
                 "shape": {"N": int(sh[0]), "C": int(sh[1]),
@@ -274,13 +368,13 @@ def assign_islands(graph: dict[str, Any]) -> dict[str, Any]:
                     emitted_head.add(t)
                     new_ops.append(_relayout_op(
                         "nchw_to_nhwc_s8", t, nm, t, f"relayout_in.{t}"))
-                    n_head += 1
+                    n_head += new_ops[-1]["op"] != "view"
             new_ops.append(o)
             for t, nm in tail_src.items():
                 if nm in (o.get("outputs") or []):
                     new_ops.append(_relayout_op(
                         "nhwc_to_nchw_s8", nm, t, t, f"relayout_out.{t}"))
-                    n_tail += 1
+                    n_tail += new_ops[-1]["op"] != "view"
         else:
             new_ops.append(o)
 
@@ -340,6 +434,9 @@ def assign_islands(graph: dict[str, Any]) -> dict[str, Any]:
         "islands": islands,
         "head_relayouts": n_head,
         "tail_relayouts": n_tail,
+        "alias_c1": alias_c1,
+        "flatten_into_linear": flatten_into_linear,
+        "flatten_absorbed": n_absorbed,
         "nhwc_tensors": sorted(t for t, v in tensors.items()
                                if v.get("layout") == "nhwc"),
     }
@@ -364,6 +461,11 @@ def main():
     a.add_argument("--hint", default=None)
     a.add_argument("--model", default=None)
     a.add_argument("--report", action="store_true")
+    a.add_argument("--alias-c1", action="store_true",
+                   help="C==1 / H*W==1 boundary relayouts become zero-cost views")
+    a.add_argument("--flatten-into-linear", action="store_true",
+                   help="keep an island output NHWC through flatten->linear by "
+                        "permuting the linear weights (no tail relayout)")
     a = a.parse_args()
     ir = json.load(open(a.inp))
     if a.report:
@@ -390,7 +492,8 @@ def main():
                  "keeps every model that does not ask for this byte-identical.")
 
     if policy == "islands":
-        ir = assign_islands(ir)
+        ir = assign_islands(ir, alias_c1=a.alias_c1,
+                            flatten_into_linear=a.flatten_into_linear)
         n = len(ir["_layout"]["nhwc_tensors"])
         print(f"[assign_layouts] policy=islands islands={ir['_layout']['islands']} "
               f"head={ir['_layout']['head_relayouts']} "

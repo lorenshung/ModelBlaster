@@ -13037,6 +13037,188 @@ for _op, _spec, _algo, _cls, _desc in (
 del _op, _spec, _algo, _cls, _desc
 
 
+# ── Build-time-folded integer requantization (pipeline/fold_quant_consts.py) ──
+# The two ops below exist only in graphs that ran fold_quant_consts. They are the
+# INTEGER semantics the curated rvv kernels already used for batchnorm2d_s8 /
+# add_s8 (rvv_batchnorm2d_s8_direct.c, rvv_add_s8_rvv_frm_rmm.c), with the per-call
+# float constant derivation moved to build time, so the reference_impl below is
+# the oracle for every backend, not just rvv.
+
+def _batchnorm2d_q_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    i16p = ctypes.POINTER(ctypes.c_int16)
+    i32p = ctypes.POINTER(ctypes.c_int32)
+    # input, M, BP, S, output, outer, C, inner, activation_min, activation_max
+    return [i8p, i32p, i32p, i16p, i8p] + [ctypes.c_int] * 5
+
+
+def _add_q_s8_argtypes():
+    import ctypes
+    i8p = ctypes.POINTER(ctypes.c_int8)
+    # a, b, output, n, ma, mb, S, activation_min, activation_max
+    return [i8p, i8p, i8p] + [ctypes.c_int] * 6
+
+
+BATCHNORM2D_Q_S8 = KernelSpec(
+    op="batchnorm2d_q_s8",
+    signature=(
+        "void kernel_batchnorm2d_q_s8(const int8_t *input, const int32_t *M, "
+        "const int32_t *BP, const int16_t *S, int8_t *output, "
+        "int outer, int C, int inner, int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Per-channel integer affine with build-time constants (a folded\n"
+        "batchnorm2d_s8). Element (o, c, i) lives at ((o*C + c)*inner + i):\n"
+        "NCHW passes outer=N, inner=H*W; NHWC passes outer=N*H*W, inner=1, so\n"
+        "one kernel serves both activation layouts.\n"
+        "  a   = input*M[c] + BP[c]            (int32; BP = B + 2^(S[c]-1))\n"
+        "  v   = (a - (a < 2^(S[c]-1))) >> S[c] (= round_half_away((x*M+B) / 2^S))\n"
+        "  out = clamp(v, activation_min, activation_max) (clamp range inside int8)\n"
+        "fold_quant_consts guarantees 128*|M| + |B| + 2^(S-1) < 2^31."
+    ),
+    reference_impl="""\
+void kernel_batchnorm2d_q_s8(const int8_t *input, const int32_t *M,
+                             const int32_t *BP, const int16_t *S, int8_t *output,
+                             int outer, int C, int inner,
+                             int activation_min, int activation_max) {
+    const int32_t lo = activation_min < -128 ? -128 : (activation_min > 127 ? 127 : activation_min);
+    const int32_t hi = activation_max < -128 ? -128 : (activation_max > 127 ? 127 : activation_max);
+    for (int o = 0; o < outer; o++) {
+        for (int c = 0; c < C; c++) {
+            const int32_t rnd = (int32_t)1 << (S[c] - 1);
+            for (int i = 0; i < inner; i++) {
+                const size_t idx = ((size_t)o * C + c) * inner + i;
+                int32_t a = (int32_t)input[idx] * M[c] + BP[c];
+                int32_t v = (a - (a < rnd ? 1 : 0)) >> S[c];
+                if (v < lo) v = lo;
+                if (v > hi) v = hi;
+                output[idx] = (int8_t)v;
+            }
+        }
+    }
+}
+""",
+    extra_shapes=[
+        {"outer": 1, "C": 32, "inner": 196},     # NCHW plane
+        {"outer": 729, "C": 32, "inner": 1},     # NHWC, dronet bn0
+        {"outer": 49, "C": 64, "inner": 1},      # NHWC, dronet bn4
+        {"outer": 7, "C": 40, "inner": 1},       # NHWC, C not a multiple of VLMAX
+    ],
+    argtypes_factory=_batchnorm2d_q_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="direct",
+            description=(
+                "Folded integer batchnorm. The curated rvv file "
+                "(kernels/rvv/rvv_batchnorm2d_q_s8_direct.c) takes the NHWC "
+                "case (inner == 1) channel-strip outer, pixels inner, so one "
+                "strip's M/BP/S are loaded into vector registers once rather "
+                "than once per pixel: on a core whose vector memory goes to DRAM "
+                "the constants would otherwise cost more bytes than the data."
+            ),
+            reference_impl="(the KernelSpec reference_impl; rvv: kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+ADD_Q_S8 = KernelSpec(
+    op="add_q_s8",
+    signature=(
+        "void kernel_add_q_s8(const int8_t *a, const int8_t *b, int8_t *output, "
+        "int n, int ma, int mb, int S, int activation_min, int activation_max)"
+    ),
+    semantics=(
+        "Elementwise int8 add with build-time integer rescale (a folded add_s8):\n"
+        "  acc = a*ma + b*mb                     (int32)\n"
+        "  v   = round_half_away(acc / 2^S) = (acc + 2^(S-1) + (acc >> 31)) >> S\n"
+        "  out = clamp(v, activation_min, activation_max)\n"
+        "fold_quant_consts guarantees 128*(|ma|+|mb|) + 2^(S-1) < 2^31."
+    ),
+    reference_impl="""\
+void kernel_add_q_s8(const int8_t *a, const int8_t *b, int8_t *output, int n,
+                     int ma, int mb, int S, int activation_min, int activation_max) {
+    const int32_t lo = activation_min < -128 ? -128 : (activation_min > 127 ? 127 : activation_min);
+    const int32_t hi = activation_max < -128 ? -128 : (activation_max > 127 ? 127 : activation_max);
+    const int32_t rnd = (int32_t)1 << (S - 1);
+    for (int i = 0; i < n; i++) {
+        int32_t acc = (int32_t)a[i] * ma + (int32_t)b[i] * mb;
+        int32_t v = (acc + rnd + (acc < 0 ? -1 : 0)) >> S;
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+        output[i] = (int8_t)v;
+    }
+}
+""",
+    extra_shapes=[{"n": 1}, {"n": 17}, {"n": 6272}],
+    argtypes_factory=_add_q_s8_argtypes,
+    algorithms=[
+        AlgorithmCandidate(
+            name="direct",
+            description=(
+                "Folded integer add. The curated rvv file "
+                "(kernels/rvv/rvv_add_q_s8_direct.c) does the round-half-away "
+                "with vnclip under vxrm=rdn: 8 m8 operations per strip instead "
+                "of the 13 of the abs/shift/re-sign sequence."
+            ),
+            reference_impl="(the KernelSpec reference_impl; rvv: kernels/rvv/)",
+            accuracy_class=AccuracyClass.BIT_EXACT,
+        ),
+    ],
+)
+
+
+# ── Accelerator lowering: RiskyBird DroNet conv0 + maxpool engine ───────────
+# A memory-mapped engine (DronetConv0.scala; conv0_engine.sv) that computes
+# exactly one conv2d_pool_s8 shape: IC=1 112x112 input, 32 output channels,
+# 3x3 s2 p1, then maxpool 3x3 s2 p0, Q0.31 requantize with a positive
+# multiplier and a non-negative shift, NHWC output. It is an ALGORITHM of
+# conv2d_pool_s8 rather than a new op kind so the schedule places it exactly
+# where the Gemmini kernel ran. The curated files are drivers: anything the
+# engine cannot compute goes to the scalar NHWC conv+pool in the same file, so a
+# graph the engine does not match still computes the right answer.
+#   dronet_conv0_mmio  CPU copies image in / result out over 8-byte MMIO
+#   dronet_conv0_dma   engine's own DMA (candidate C) when its ID reads back,
+#                      MMIO copies otherwise (one ELF for both bitstreams)
+# Built for the host (no __riscv) or with -DMB_DRONET_CONV0_MODEL, the register
+# accesses go to a C functional model of the device (window, registers, engine
+# numerics: pool the int32 accumulators, then requantize), so the driver's
+# weight/param packing and DMA arguments are checked off-board against
+# reference_impl. Selected with generate_kernels --pin-algorithm.
+def _dronet_conv0_applicable(sh: dict) -> bool:
+    return (sh.get("N", 1) == 1 and sh.get("IC") == 1 and sh.get("IH") == 112
+            and sh.get("IW") == 112 and sh.get("OC") == 32
+            and sh.get("KH") == 3 and sh.get("KW") == 3 and sh.get("SH") == 2
+            and sh.get("SW") == 2 and sh.get("PH") == 1 and sh.get("PW") == 1
+            and sh.get("pool_KH") == 3 and sh.get("pool_KW") == 3
+            and sh.get("pool_SH") == 2 and sh.get("pool_SW") == 2
+            and sh.get("pool_PH", 0) == 0 and sh.get("pool_PW", 0) == 0
+            and sh.get("pool_DH", 1) == 1 and sh.get("pool_DW", 1) == 1)
+
+
+for _name, _desc in (
+        ("dronet_conv0_mmio",
+         "conv0 engine, CPU copies over uncached 8-byte MMIO (README §9: "
+         "~38 cycles per access)."),
+        ("dronet_conv0_dma",
+         "conv0 engine with its DMA (README §10); falls back to the MMIO copies "
+         "when the DMA ID register does not read 'CDMA' v1.")):
+    CONV2D_POOL_S8.algorithms.append(AlgorithmCandidate(
+        name=_name,
+        target_affinity=GEMMINI_TARGETS,
+        act_layouts=("nhwc",),
+        weight_layout="hwio",
+        accuracy_class=AccuracyClass.BIT_EXACT,
+        applicable=_dronet_conv0_applicable,
+        description=_desc + " Any other shape or quantization runs the scalar "
+                    "NHWC conv-then-pool in the same file.",
+        reference_impl="",  # the curated .c file supplies the impl
+    ))
+del _name, _desc
+
+
 KERNEL_SPECS: dict[str, KernelSpec] = {
     'linear': LINEAR,
     'matmul': MATMUL,
@@ -13084,6 +13266,8 @@ KERNEL_SPECS: dict[str, KernelSpec] = {
     'maxpool2d_s8': MAXPOOL2D_S8,
     'add_s8': ADD_S8,
     'batchnorm2d_s8': BATCHNORM2D_S8,
+    'batchnorm2d_q_s8': BATCHNORM2D_Q_S8,
+    'add_q_s8': ADD_Q_S8,
     'sigmoid_s8': SIGMOID_S8,
     'relu_f16': RELU_F16,
     'sigmoid_f16': SIGMOID_F16,
