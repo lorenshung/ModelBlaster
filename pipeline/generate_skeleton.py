@@ -2095,6 +2095,10 @@ def _apply_linear_weight_perm(w: np.ndarray, p: dict) -> np.ndarray:
         w.reshape(w.shape[0], C, H, W).transpose(0, 2, 3, 1).reshape(w.shape[0], -1))
 
 
+#: Op kinds with a one-time setup call (model_<mid>_init); see the d_engine_s8 arm.
+_OPS_WITH_INIT = {"d_engine_s8"}
+
+
 def _shape_str(op: dict) -> str:
     """Stable, parseable per-op shape string for the profile CSV.
 
@@ -2573,6 +2577,14 @@ typedef model_{mid}_state_t       model_state_t;
 typedef model_{mid}_dispatch_fn   model_dispatch_fn;
 #endif
 """
+    # One-time model setup (see model_init_calls). Declared only for graphs that
+    # need it; the xpurt main calls it before its timed region under this macro.
+    if any(o.get("op") in _OPS_WITH_INIT for o in ir["ops"]):
+        h = h.rstrip("\n") + (
+            f"\n\n/* One-time setup before the first inference (e.g. loading an accelerator's\n"
+            f" * weights); the schedule-driven runtime calls it outside its timed region. */\n"
+            f"#define MODEL_{umid}_HAS_INIT 1\n"
+            f"void model_{mid}_init(void);\n")
     with open(os.path.join(out_dir, "model.h"), "w") as f:
         f.write(h)
 
@@ -2663,6 +2675,10 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
         return _buf_name(mid, tensor)
 
     call_blocks: list[str] = []  # legacy — no longer used in run_model body
+    # Per-model one-time setup calls (model_<mid>_init). Only ops that need one
+    # add to it, and model.h/model.c gain the init entry point only then, so a
+    # graph without such an op generates exactly what it did before.
+    model_init_calls: list[str] = []
     dispatch_fns: list[str] = []
     # File-scope `static const` tables of per-shard weight pointers, one per
     # sharded conv. File scope rather than inside the dispatch function so the
@@ -3495,6 +3511,10 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
             n_out = sum(_prod(tensors[t]["shape"]) for t in op["outputs"])
             call = (f"kernel_d_engine_s8({in_ptr}, {blob}, {op['shape']['blob_bytes']}, "
                     f"{out_ptr}, {n_out})")
+            # One-time setup (load the blob into the engine) belongs before the
+            # timed region: the op's protocol is input == NULL -> setup only.
+            model_init_calls.append(
+                f"kernel_d_engine_s8_{mid}(NULL, {blob}, {op['shape']['blob_bytes']}, NULL, 0);")
         elif op["op"] == "add_q_s8":
             a_ptr = ptr_for(op["inputs"][0], "in")
             b_ptr = ptr_for(op["inputs"][1], "in")
@@ -4611,6 +4631,10 @@ unsigned long model_{mid}_wall_cycles(void) {{
     return wall_cycles_;
 }}
 """
+    if model_init_calls:
+        c = c.rstrip("\n") + (
+            f"\n\nvoid model_{mid}_init(void) {{\n"
+            + "".join(f"    {x}\n" for x in model_init_calls) + "}\n")
     with open(os.path.join(out_dir, "model.c"), "w") as f:
         f.write(c)
 

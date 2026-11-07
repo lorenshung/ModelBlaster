@@ -13265,7 +13265,9 @@ D_ENGINE_S8 = KernelSpec(
     ),
     semantics=(
         "Run a RiskyBird engine D blob on one 112x112 int8 image: output[0] = head byte 0\n"
-        "(linear1), output[1] = the blob's sigmoid table at head byte 1 (sigmoid1)."
+        "(linear1), output[1] = the blob's sigmoid table at head byte 1 (sigmoid1).\n"
+        "input == NULL is the one-time setup call (load the blob), made from\n"
+        "model_<mid>_init() before the timed region."
     ),
     reference_impl="""\
 #include "d_engine_host.h"
@@ -13273,6 +13275,7 @@ void kernel_d_engine_s8(const int8_t *input, const int8_t *blob, int blob_len,
                         int8_t *output, int n_out) {
     uint8_t head[16]; int8_t out[2];
     (void)blob_len;
+    if (!input) { d_model_load(blob); return; }   /* setup call (model_<mid>_init) */
     d_model_frame(blob, input, head, 0, out);
     for (int i = 0; i < n_out && i < 2; i++) output[i] = out[i];
 }
