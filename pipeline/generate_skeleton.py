@@ -3487,6 +3487,14 @@ typedef model_{mid}_dispatch_fn   model_dispatch_fn;
                 f"{_f32(q['scale_out'])}, "
                 f"{q['activation_min']}, {q['activation_max']})"
             )
+        elif op["op"] == "d_engine_s8":
+            # lower_d_engine.py: the whole network is one call; its outputs are
+            # the model outputs, contiguous in s->output.
+            in_ptr = ptr_for(op["inputs"][0], "in")
+            blob = _weight_name(model_name, op["weight"], backend)
+            n_out = sum(_prod(tensors[t]["shape"]) for t in op["outputs"])
+            call = (f"kernel_d_engine_s8({in_ptr}, {blob}, {op['shape']['blob_bytes']}, "
+                    f"{out_ptr}, {n_out})")
         elif op["op"] == "add_q_s8":
             a_ptr = ptr_for(op["inputs"][0], "in")
             b_ptr = ptr_for(op["inputs"][1], "in")

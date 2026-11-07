@@ -1,0 +1,18 @@
+{
+  "system": "chipyard-ku040-lean",
+  "description": "RiskyBird option-2 KU040 SoC (RocketKU040LeanConfig): ONE Rocket hart (rv64imafc, FP32 FPU, no D, no vector, no RoCC), 50 MHz, optionally engine D on the periphery bus. Every dispatch runs on hart 0 with the scalar backend (images are soft-float, -march=rv64imac -mabi=lp64); with engine D the network is one d_engine_s8 dispatch.",
+  "default_dispatch_target": "any",
+  "cores": [
+    {
+      "name": "rocket0",
+      "kind": "scalar",
+      "isa": "rv64imafc",
+      "harts": [0],
+      "description": "Rocket, scalar backend for every op; drives engine D when present.",
+      "capabilities": [
+        "linear_s8", "conv2d_s8", "conv2d_pool_s8", "relu_s8", "add_s8", "add_q_s8",
+        "maxpool2d_s8", "batchnorm2d_s8", "batchnorm2d_q_s8", "sigmoid_s8", "d_engine_s8"
+      ]
+    }
+  ]
+}
