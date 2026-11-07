@@ -5,8 +5,10 @@
 set -euo pipefail
 GEN=$(readlink -f "$1"); BK=$2; GOLD=$(readlink -f "$3"); O=${4:-$GEN/replay_$BK}; shift 3; [ $# -gt 0 ] && shift
 H=$(dirname "$(readlink -f "$0")"); MB=$(readlink -f "$H/../..")
-: "${RT:=/scratch2/loren/riskybird-dev/backends/chipyard/.conda-env/riscv-tools}"
-: "${CC14:=/scratch2/loren/riskybird-dev/backends/zephyr-chipyard-sw/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/bin/riscv64-zephyr-elf-gcc}"
+: "${CHIPYARD:?set CHIPYARD to a Chipyard checkout (riscv-tools conda env, tests/htif.ld)}"
+: "${RT:=$CHIPYARD/.conda-env/riscv-tools}"
+: "${HTIF_LD:=$CHIPYARD/tests/htif.ld}"
+: "${CC14:?set CC14 to the Zephyr SDK riscv64-zephyr-elf-gcc}"
 : "${PYTHON:=python3}"
 mkdir -p "$O"
 $PYTHON "$H/gen_replay.py" "$GEN" "$BK" "$GOLD" "$O/replay.c" "$@"
@@ -22,5 +24,5 @@ for s in model kernels weights buffers; do $CC14 $F -c $D/$s.c -o $O/$s.o; done
 for x in ${EXTRA_SRCS:-}; do $CC14 $F -c $x -o $O/extra_$(basename $x .c).o; done
 $CC14 $F -c $O/replay.c -o $O/replay.o
 $RT/bin/riscv64-unknown-elf-gcc -march=rv64gcv -mabi=lp64d -mcmodel=medany -specs=htif_nano.specs -static \
-  -T /scratch2/loren/riskybird-dev/backends/chipyard/tests/htif.ld $O/*.o -lm -o $O/replay.riscv
+  -T "$HTIF_LD" $O/*.o -lm -o $O/replay.riscv
 $RT/bin/spike --isa=rv64gcv_zicntr_zvl128b ${SPIKE_EXTRA:-} $O/replay.riscv

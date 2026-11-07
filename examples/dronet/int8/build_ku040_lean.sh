@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DroNet for the RiskyBird option-2 SoC (RocketKU040LeanConfig): ONE Rocket hart (rv64imafc, FP32 FPU,
-# no vector, no Gemmini), optionally engine D. Same toolchain/env variables as build_ku040_dual_nhwc.sh.
+# no vector, no Gemmini), optionally engine D. Same toolchain/env variables as build_ku040_dual_nhwc_lowered.sh.
 #
 #   MODE=cpu  all-CPU baseline: extract -> fold_quant_consts (integer BN/add, no per-frame soft-float)
 #             -> NCHW graph (no layout islands: every kernel is the scalar backend's) -> scalar kernels.
@@ -17,12 +17,12 @@
 # kernel, -march=rv64imac -mabi=lp64). Outputs: $GEN and $SCHED next to $BUILD_DIR.
 set -u
 : "${MB:=$(cd "$(dirname "$0")/../../.." && pwd)}"
-: "${ZCS:=/scratch2/dima/misc_sw/XPU-RT/zephyr-chipyard-sw}"
+: "${ZCS:?set ZCS to the zephyr-chipyard-sw checkout}"
 : "${ZEPHYR_SDK:=$ZCS/tools-manual/zephyr-sdk-1.0.0-beta1}"
-: "${CONDA_SH:=/scratch2/dima/miniforge3/etc/profile.d/conda.sh}"
+: "${CONDA_SH:?set CONDA_SH to etc/profile.d/conda.sh of a conda install}"
 : "${CONDA_ENV:=zephyr}"
-: "${LEAN_OVERLAY:=/scratch2/loren/soc-cache/p2goal/hw/zephyr/ku040_lean.overlay}"
-: "${LEAN_CONF:=/scratch2/loren/soc-cache/p2goal/hw/zephyr/ku040_lean.conf}"
+: "${LEAN_OVERLAY:?set LEAN_OVERLAY to the single-hart SoC devicetree overlay}"
+: "${LEAN_CONF:?set LEAN_CONF to the single-hart SoC Kconfig fragment}"
 : "${MODE:=cpu}"
 : "${D_SHAPE:=16,16,4}"
 : "${D_BASE:=0x11000000}"

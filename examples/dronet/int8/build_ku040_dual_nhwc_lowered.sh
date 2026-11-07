@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # KU040 dual-hart DroNet, NHWC, with the RiskyBird lowerings selectable as recipe options.
-# Same toolchain/env contract as build_ku040_dual_nhwc.sh (and the same variables), but the
-# model and the schedule are ALWAYS regenerated, into a per-image directory, because the
-# lowerings change the dispatch list and the committed ku040_dual_nhwc/ table hard-codes
-# 28 dispatch ids (building a 20-dispatch graph against it would run the wrong functions).
+# Same toolchain/env contract as the platform's build_ku040_dual_nhwc.sh (and the same
+# variables), but the model and the schedule are ALWAYS regenerated, into a per-image
+# directory, because the lowerings change the dispatch list and a committed 28-entry
+# dispatch table would run the wrong functions for a 20-dispatch graph.
+#
+# The SoC-specific inputs are not part of this repository and must be given:
+#   REGISTRY       core registry of the dual-hart SoC (hart 0 rvv, hart 1 gemmini_q31)
+#   LAYOUT_HINT    DroNet layout hint for assign_layouts --policy islands
+#   ZCS, CONDA_SH, GEMMINI_SPIKE, GEMMINI_LIB, CONSOLE_OVERLAY, CONSOLE_CONF   toolchain/board
 #
 # Recipe options (environment):
 #   LOWER_SW=1     software lowerings:
@@ -13,7 +18,7 @@
 #                                           BN joins the NHWC island (no relayouts around it), the
 #                                           C=1 input relayout is an alias, and the linears take
 #                                           NHWC-permuted weights (no tail relayout).
-#                  0 = the baseline graph (identical to build_ku040_dual_nhwc.sh's).
+#                  0 = the baseline graph (identical to the platform build_ku040_dual_nhwc.sh's).
 #   LOWER_SW=keep  the same lowerings, schedule-preserving form: assign_layouts --elide-relayouts
 #                  keeps the 8 relayout dispatches as empty bodies, so the 28-entry schedule is the
 #                  baseline's (the form of the hand-patched v2 image; for byte/fps A/B against it).
@@ -32,14 +37,16 @@
 # main) next to $BUILD_DIR, so every image keeps its own sources.
 set -u
 : "${MB:=$(cd "$(dirname "$0")/../../.." && pwd)}"
-: "${ZCS:=/scratch2/dima/misc_sw/XPU-RT/zephyr-chipyard-sw}"
+: "${ZCS:?set ZCS to the zephyr-chipyard-sw checkout}"
 : "${ZEPHYR_SDK:=$ZCS/tools-manual/zephyr-sdk-1.0.0-beta1}"
-: "${CONDA_SH:=/scratch2/dima/miniforge3/etc/profile.d/conda.sh}"
+: "${CONDA_SH:?set CONDA_SH to etc/profile.d/conda.sh of a conda install}"
 : "${CONDA_ENV:=zephyr}"
-: "${GEMMINI_SPIKE:=/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/bin/spike}"
-: "${GEMMINI_LIB:=/scratch2/dima/chipyard-fsim/.conda-env/riscv-tools/lib/libgemmini.so}"
-: "${CONSOLE_OVERLAY:=/scratch2/dima/misc_sw/ku040_dronedual_console.overlay}"
-: "${CONSOLE_CONF:=/scratch2/dima/misc_sw/ku040_dronedual_console.conf}"
+: "${GEMMINI_SPIKE:?set GEMMINI_SPIKE to a spike with the Gemmini extension}"
+: "${GEMMINI_LIB:?set GEMMINI_LIB to libgemmini.so}"
+: "${CONSOLE_OVERLAY:?set CONSOLE_OVERLAY to the board console devicetree overlay}"
+: "${CONSOLE_CONF:?set CONSOLE_CONF to the board console Kconfig fragment}"
+: "${REGISTRY:?set REGISTRY to the dual-hart SoC core registry JSON}"
+: "${LAYOUT_HINT:?set LAYOUT_HINT to the DroNet layout hint JSON}"
 : "${GEMMINI_CONFIG:=q31ws_32x32_acc}"
 : "${BUILD_DIR:=$MB/examples/dronet/int8/build/ku040_dronet_nhwc_lowered}"
 : "${LOWER_SW:=1}"
@@ -95,7 +102,7 @@ if [ "$BUILD_ONLY" != "1" ]; then
   fi
   echo "== assign_layouts --policy islands ${LAYOUT_FLAGS[*]} =="
   python pipeline/assign_layouts.py "$GEN/graph.json" "$GEN/graph.json" --policy islands \
-      --hint examples/dronet/int8/dronet_layout_hint.json --model dronet --report \
+      --hint "$LAYOUT_HINT" --model dronet --report \
       "${LAYOUT_FLAGS[@]}" || die assign_layouts
   for BK in gemmini_q31_rvv rvv; do
     BKPIN=(); [ "$BK" = gemmini_q31_rvv ] && BKPIN=("${PIN[@]}")
@@ -119,7 +126,7 @@ if [ "$BUILD_ONLY" != "1" ]; then
 import json,sys
 g=json.load(open(sys.argv[1])); opk={o.get("dispatch_id"):o.get("op") for o in g["ops"] if o.get("dispatch_id") is not None}
 S=json.load(open(sys.argv[2]))
-# Same placement rule as build_ku040_dual_nhwc.sh: Gemmini-side kinds -> hart1, the rest -> hart0.
+# Same placement rule as the platform build_ku040_dual_nhwc.sh: Gemmini-side kinds -> hart1, the rest -> hart0.
 GEM={"conv2d_s8","conv2d_pool_s8","nchw_to_nhwc_s8","nhwc_to_nchw_s8"}
 import os
 if os.environ.get("ACCEL_B") == "1":
@@ -130,7 +137,7 @@ for k,v in S["dispatches"].items():
 json.dump(S,open(sys.argv[2],"w"),indent=2)
 PY
   python -m modelblaster.pipeline.ingest_xpurt_schedule --schedule "$SCHED/dronet_ku040_nhwc_sched.json" \
-      --registry cores/chipyard_ku040_dronedual_q31.json --ir dronet:"$GEN/graph.json" \
+      --registry "$REGISTRY" --ir dronet:"$GEN/graph.json" \
       --cpu-p-kind gemmini_q31 --cpu-e-kind rvv --name ku040_dronet_nhwc_dev \
       --out "$SCHED/ku040_dronet_nhwc_dev.c" || die ingest
   python -m modelblaster.pipeline.generate_xpurt_main --schedule "$SCHED/dronet_ku040_nhwc_sched.json" \
@@ -138,7 +145,7 @@ PY
       --dispatch-table-header ku040_dronet_nhwc_dev.h --platform zephyr \
       --core-kinds rvv,gemmini_q31 --backends rvv,gemmini_q31_rvv \
       --model-gen-dir dronet="$GEN/gemmini_q31_rvv" --networks dronet \
-      --registry cores/chipyard_ku040_dronedual_q31.json || die main
+      --registry "$REGISTRY" || die main
 fi
 
 SOFTFLOAT_CONF=$(mktemp)

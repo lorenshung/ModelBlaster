@@ -4,8 +4,10 @@
 set -euo pipefail
 H=$(cd "$(dirname "$0")" && pwd); MB=$(cd "$H/../.." && pwd)  # logical path: the package dir must be named modelblaster
 O=${1:-/tmp/rb_q_kernels}; mkdir -p $O
-: "${RT:=/scratch2/loren/riskybird-dev/backends/chipyard/.conda-env/riscv-tools}"
-: "${CC14:=/scratch2/loren/riskybird-dev/backends/zephyr-chipyard-sw/tools-manual/zephyr-sdk-1.0.0-beta1/gnu/riscv64-zephyr-elf/bin/riscv64-zephyr-elf-gcc}"
+: "${CHIPYARD:?set CHIPYARD to a Chipyard checkout (riscv-tools conda env, tests/htif.ld)}"
+: "${RT:=$CHIPYARD/.conda-env/riscv-tools}"
+: "${HTIF_LD:=$CHIPYARD/tests/htif.ld}"
+: "${CC14:?set CC14 to the Zephyr SDK riscv64-zephyr-elf-gcc}"
 : "${PYTHON:=python3}"
 PYTHONPATH=$(dirname "$MB") $PYTHON - "$O" <<'PY'
 import sys
@@ -66,5 +68,5 @@ $CC14 $F -c $MB/kernels/rvv/rvv_add_q_s8_direct.c -o $O/add.o
 $CC14 $F -c $O/ref.c -o $O/ref.o
 $CC14 $F -c $O/main.c -o $O/main.o
 $RT/bin/riscv64-unknown-elf-gcc -march=rv64gcv -mabi=lp64d -mcmodel=medany -specs=htif_nano.specs -static \
-  -T /scratch2/loren/riskybird-dev/backends/chipyard/tests/htif.ld $O/*.o -o $O/t.riscv
+  -T "$HTIF_LD" $O/*.o -o $O/t.riscv
 $RT/bin/spike --isa=rv64gcv_zicntr_zvl128b $O/t.riscv
