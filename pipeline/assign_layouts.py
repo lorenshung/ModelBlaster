@@ -91,7 +91,7 @@ def _is_4d(ir, t):
     return len(list(((ir.get("tensors") or {}).get(t) or {}).get("shape") or [])) == 4
 
 
-def _eligible(ir, op) -> bool:
+def _eligible(ir, op, exclude=frozenset()) -> bool:
     """Can this op sit INSIDE an island?
 
     Refusals here are the safety half of the pass, and each has a specific
@@ -111,7 +111,7 @@ def _eligible(ir, op) -> bool:
         permute.
     """
     kind = op.get("op")
-    if kind in ISLAND_FORBIDDEN:
+    if kind in ISLAND_FORBIDDEN or kind in exclude:
         return False
     if kind in LAYOUT_AGNOSTIC:
         return True
@@ -125,7 +125,7 @@ def _eligible(ir, op) -> bool:
     return True
 
 
-def _islands(ir, ops):
+def _islands(ir, ops, exclude=frozenset()):
     """Maximal runs of eligible ops, connected through their tensors.
 
     Connectivity is on the dataflow graph, not on program order: an op joins an
@@ -138,7 +138,7 @@ def _islands(ir, ops):
     for o in ops:
         for t in (o.get("outputs") or []):
             prod[t] = o["dispatch_id"]
-    elig = {o["dispatch_id"]: o for o in ops if _eligible(ir, o)}
+    elig = {o["dispatch_id"]: o for o in ops if _eligible(ir, o, exclude)}
     parent = {d: d for d in elig}
 
     def find(a):
@@ -230,8 +230,44 @@ def _flatten_absorb(out, t, consumers, island_ids, out_names):
     return linears, closure, (C, H, W)
 
 
+def _elide(out, new_ops, in_names, out_names):
+    """--elide-relayouts: every relayout op keeps its dispatch but loses its body."""
+    tensors = out["tensors"]
+    for o in new_ops:
+        if o.get("op") not in ("nchw_to_nhwc_s8", "nhwc_to_nchw_s8"):
+            continue
+        o["elided"] = True
+        for t in (o["inputs"][0], o["outputs"][0]):
+            sh = tensors[t].get("shape") or []
+            if t in in_names or t in out_names:
+                if len(sh) != 4 or (int(sh[1]) != 1 and int(sh[2]) * int(sh[3]) != 1):
+                    raise SystemExit(f"[assign_layouts] cannot elide {o['name']}: {t!r} is a "
+                                     f"model input/output whose NCHW and NHWC bytes differ")
+                continue
+            tensors[t]["layout"] = "nhwc"
+    consumers = collections.defaultdict(list)
+    for o in new_ops:
+        for t in (o.get("inputs") or []):
+            consumers[t].append(o)
+    for o in new_ops:
+        if o.get("elided") and o["op"] == "nhwc_to_nchw_s8":
+            t = o["outputs"][0]
+            if any(c.get("op") == "view" for c in consumers.get(t, [])):
+                ab = _flatten_absorb(out, t, consumers, set(), out_names)
+                if ab is None:
+                    raise SystemExit(f"[assign_layouts] cannot elide {o['name']}: its output "
+                                     f"is flattened into something other than linears")
+                linears, closure, (C, H, W) = ab
+                for lo in linears:
+                    lo["weight_perm"] = {"kind": "nhwc_flatten", "C": C, "H": H, "W": W}
+                for ct in closure:
+                    tensors[ct]["flat_order"] = "nhwc"
+    return 0, 0
+
+
 def assign_islands(graph: dict[str, Any], alias_c1: bool = False,
-                   flatten_into_linear: bool = False) -> dict[str, Any]:
+                   flatten_into_linear: bool = False,
+                   elide_relayouts: bool = False) -> dict[str, Any]:
     """Rewrite `graph`: mark island tensors nhwc and insert boundary relayouts.
 
     alias_c1: a boundary tensor with C == 1 (or H*W == 1) has the same bytes in
@@ -241,11 +277,23 @@ def assign_islands(graph: dict[str, Any], alias_c1: bool = False,
         flatten -> (elementwise)* -> linear tail stays NHWC; the linears get a
         `weight_perm` that generate_skeleton.emit_weights applies to their K
         axis, so no tail relayout is emitted (see _flatten_absorb).
+    elide_relayouts: place islands and relayouts exactly as the plain policy
+        does (folded BN kept OUT of the island), then mark every relayout
+        `elided`: it stays a dispatch, so the dispatch list and the schedule
+        are the plain policy's, but it has no body and its output aliases its
+        input. Every tensor it touches becomes NHWC (the folded BN and the
+        elementwise ops read NHWC directly), and a flatten -> linear tail gets
+        permuted weights. This is the schedule-preserving form of the two
+        flags above, for A/B against a build that kept those dispatches.
     """
+    if elide_relayouts and (alias_c1 or flatten_into_linear):
+        raise SystemExit("[assign_layouts] --elide-relayouts replaces --alias-c1 / "
+                         "--flatten-into-linear; pass one form or the other")
     out = copy.deepcopy(graph)
     tensors = out.setdefault("tensors", {})
     ops = [o for o in out["ops"] if o.get("dispatch_id") is not None]
-    islands = _islands(out, ops)
+    islands = _islands(out, ops, frozenset({"batchnorm2d_q_s8"}) if elide_relayouts
+                       else frozenset())
     if not islands:
         raise SystemExit(
             "[assign_layouts] policy 'islands' found no island in this graph. "
@@ -426,6 +474,8 @@ def assign_islands(graph: dict[str, Any], alias_c1: bool = False,
                 deps.append(p)
         o["depends_on"] = sorted(deps)
 
+    if elide_relayouts:
+        n_head, n_tail = _elide(out, new_ops, in_names, out_names)
     out["ops"] = new_ops
     if isinstance(out.get("dispatches"), list):
         out["dispatches"] = [o["dispatch_id"] for o in new_ops
@@ -439,6 +489,7 @@ def assign_islands(graph: dict[str, Any], alias_c1: bool = False,
         "alias_c1": alias_c1,
         "flatten_into_linear": flatten_into_linear,
         "flatten_absorbed": n_absorbed,
+        "elide_relayouts": elide_relayouts,
         "nhwc_tensors": sorted(t for t, v in tensors.items()
                                if v.get("layout") == "nhwc"),
     }
@@ -465,6 +516,9 @@ def main():
     a.add_argument("--report", action="store_true")
     a.add_argument("--alias-c1", action="store_true",
                    help="C==1 / H*W==1 boundary relayouts become zero-cost views")
+    a.add_argument("--elide-relayouts", action="store_true",
+                   help="keep the plain policy's relayout dispatches (same schedule) "
+                        "but give them no body; consumers read NHWC directly")
     a.add_argument("--flatten-into-linear", action="store_true",
                    help="keep an island output NHWC through flatten->linear by "
                         "permuting the linear weights (no tail relayout)")
@@ -495,7 +549,8 @@ def main():
 
     if policy == "islands":
         ir = assign_islands(ir, alias_c1=a.alias_c1,
-                            flatten_into_linear=a.flatten_into_linear)
+                            flatten_into_linear=a.flatten_into_linear,
+                            elide_relayouts=a.elide_relayouts)
         n = len(ir["_layout"]["nhwc_tensors"])
         print(f"[assign_layouts] policy=islands islands={ir['_layout']['islands']} "
               f"head={ir['_layout']['head_relayouts']} "

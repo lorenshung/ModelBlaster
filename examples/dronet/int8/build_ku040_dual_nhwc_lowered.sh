@@ -14,6 +14,9 @@
 #                                           C=1 input relayout is an alias, and the linears take
 #                                           NHWC-permuted weights (no tail relayout).
 #                  0 = the baseline graph (identical to build_ku040_dual_nhwc.sh's).
+#   LOWER_SW=keep  the same lowerings, schedule-preserving form: assign_layouts --elide-relayouts
+#                  keeps the 8 relayout dispatches as empty bodies, so the 28-entry schedule is the
+#                  baseline's (the form of the hand-patched v2 image; for byte/fps A/B against it).
 #   ACCEL=none|mmio|dma
 #                  conv2d_pool_s8 (conv0 + maxpool1) on hart 1:
 #                    none  Gemmini tiled_conv_pool_nhwc (default)
@@ -73,12 +76,13 @@ if [ "$BUILD_ONLY" != "1" ]; then
   python -m modelblaster.pipeline.extract_graph --model dronet --out-dir "$GEN" \
       --quant int8 --num-calibration 1 --fusion-target gemmini_q31_rvv || die extract
   LAYOUT_FLAGS=()
-  if [ "$LOWER_SW" = "1" ]; then
+  if [ "$LOWER_SW" = "1" ] || [ "$LOWER_SW" = "keep" ]; then
     echo "== fold_quant_consts (BN + add constants at build time) =="
     EXACT=(); [ "$FOLD_REQUIRE_EXACT" = "1" ] && EXACT=(--require-exact)
     python pipeline/fold_quant_consts.py "$GEN/graph.json" "$GEN/weights.npz" \
         --ops batchnorm2d_s8,add_s8 "${EXACT[@]}" || die fold
     LAYOUT_FLAGS=(--alias-c1 --flatten-into-linear)
+    [ "$LOWER_SW" = "keep" ] && LAYOUT_FLAGS=(--elide-relayouts)
   fi
   echo "== assign_layouts --policy islands ${LAYOUT_FLAGS[*]} =="
   python pipeline/assign_layouts.py "$GEN/graph.json" "$GEN/graph.json" --policy islands \
