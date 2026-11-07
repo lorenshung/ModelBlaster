@@ -1527,6 +1527,8 @@ def curated_seed_for(ir, specs, target, global_curated_dir,
             key=lambda a: (getattr(a, "accuracy_class", 0) or 0),
         )
         for algorithm in cands:
+            if getattr(algorithm, "pin_only", False):
+                continue    # opt-in lowerings never become anyone's baseline
             cp = _curated_path(
                 global_curated_dir, target.name, spec.op, algorithm.name)
             if cp is None:
@@ -1768,7 +1770,7 @@ def generate(
                     # Already swapped by an earlier source (cache beats
                     # global_curated, since cache was vetted for THIS model).
                     continue
-                _algos = spec.algorithms
+                _algos = [a for a in spec.algorithms if not getattr(a, "pin_only", False)]
                 if pin_algorithms and spec.op in pin_algorithms:
                     _algos = [a for a in spec.algorithms
                               if a.name == pin_algorithms[spec.op]]
