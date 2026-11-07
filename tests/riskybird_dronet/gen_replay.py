@@ -61,6 +61,9 @@ def main():
         if r != t and len(sh) == 2:          # a flatten view: the 4-D tensor's order
             t, meta, sh = r, tensors.get(r, {}), tensors.get(r, {}).get("shape") or []
         gm = gold.get(t)
+        if gm is None and r != t:            # a layout alias (assign_layouts --alias-c1)
+            t, meta, sh = r, tensors.get(r, {}), tensors.get(r, {}).get("shape") or []
+            gm = gold.get(t)
         if gm is None:
             return None
         if len(sh) == 4 and meta.get("layout", "nchw") != "nhwc" and int(sh[1]) != 1:

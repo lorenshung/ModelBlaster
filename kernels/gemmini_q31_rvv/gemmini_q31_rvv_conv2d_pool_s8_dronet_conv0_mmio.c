@@ -1,0 +1,267 @@
+/* source: curated */
+/* algorithm: dronet_conv0_mmio */
+/* accuracy_class: bit_exact */
+/* origin: hand-written. GENERATED from kernels/riskybird/dronet_conv0_driver.c.in by
+ *         kernels/riskybird/make_conv0_drivers.sh -- edit the template, not this file.
+ *
+ * conv2d_pool_s8 on the RiskyBird DroNet conv0 + maxpool engine (candidate A;
+ * DronetConv0.scala, conv0_engine.sv, conv0_mmio.sv), the CPU copying the image in and the result out with 8-byte uncached MMIO accesses (README §9).
+ *
+ * The engine computes one shape: IC=1, 112x112 int8 input, 32 output channels,
+ * 3x3 stride 2 pad 1, then maxpool 3x3 stride 2 pad 0, NHWC output [27,27,32],
+ * HWIO weights, Q0.31 requantize (positive multiplier, shift 0..31, zero offsets).
+ * Anything else runs the scalar NHWC conv-then-pool below, so a graph the engine
+ * does not match still gets the right answer.
+ *
+ * Numerics. The engine pools the int32 accumulators, then requantizes:
+ *   t = (acc*M + 2^30) >> 31; y = (t + 2^(s-1)) >> s; clamp[amin, amax]
+ * which equals the reference's requantize-then-pool for M > 0 (monotone). It is
+ * bit-exact with KernelSpec CONV2D_POOL_S8.reference_impl, not with the Gemmini
+ * kernel (2 of 23,328 maxpool1 values differ by 1; see the golden NUMERICS.md).
+ *
+ * Device map (0x1100_0000, 64 KiB window, 8-byte accesses):
+ *   0x0000-0x30FF image (12,544 B, NCHW == NHWC for C = 1)
+ *   0x4000-0x9B1F result NHWC (23,328 B)
+ *   0xE000-0xE11F weights, 36 words: word (tap*4 + q) holds lanes 8q..8q+7, one byte each
+ *   0xE200-0xE27F bias, 16 words: lane 2k in [31:0], lane 2k+1 in [63:32]
+ *   0xF000 ID 0x0000_0001_434E_5244 ("DRNC" v1)  0xF008 CTRL bit0 start / STATUS bit0 busy, bit1 done
+ *   0xF010 CYCLES  0xF018 PARAMS [30:0] mult, [36:32] shift, [47:40] act_min, [55:48] act_max
+ *   DMA (candidate C): 0xF100 EXT, 0xF108 LOC, 0xF110 LEN, 0xF118 CTRL(go, bit1 to-memory) /
+ *   STATUS (bit0 busy, bit1 done, bit2 error), 0xF120 CYCLES, 0xF128 ID 0x0000_0001_414D_4443 ("CDMA" v1)
+ *
+ * Off-board: built for a non-RISC-V host, or with -DMB_DRONET_CONV0_MODEL, every
+ * register access goes to a C functional model of the device (same window, same
+ * registers, same engine numerics, DMA argument checks), so ModelBlaster's verify
+ * step and the spike replay exercise this driver -- packing, parameters, DMA
+ * lengths -- against reference_impl without the board. -DMB_DRONET_CONV0_MODEL_NO_DMA
+ * models a bitstream without the DMA (ID reads 0).
+ *
+ * Read back over JTAG (globals): c0_id, c0_engine_cycles, c0_dma_id,
+ * c0_dma_in_cycles, c0_dma_out_cycles, c0_dma_status, c0_calls, c0_fallbacks. */
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+
+#define C0_USE_DMA 0
+
+unsigned long long c0_engine_cycles, c0_id;
+unsigned long long c0_dma_id, c0_dma_in_cycles, c0_dma_out_cycles, c0_dma_status;
+unsigned long long c0_calls, c0_fallbacks;
+
+#if !defined(__riscv) || defined(MB_DRONET_CONV0_MODEL)
+/* ---------------- functional model of the device ---------------- */
+static uint8_t c0m_win[0x10000];
+static uint64_t c0m_status, c0m_cycles, c0m_dma_ext, c0m_dma_loc, c0m_dma_len, c0m_dma_status, c0m_dma_cycles;
+static void c0m_engine(void) {
+    const int8_t *img = (const int8_t *)c0m_win;
+    const uint64_t prm = *(const uint64_t *)(c0m_win + 0xF018);
+    const int64_t mult = (int64_t)(prm & 0x7FFFFFFF);
+    const int shift = (int)((prm >> 32) & 31);
+    const int amin = (int8_t)(prm >> 40), amax = (int8_t)(prm >> 48);
+    for (int oc = 0; oc < 32; oc++) {
+        const int32_t bias = (int32_t)(*(const uint64_t *)(c0m_win + 0xE200 + 8 * (oc / 2)) >> (32 * (oc & 1)));
+        int8_t w[9];
+        for (int t = 0; t < 9; t++)
+            w[t] = (int8_t)c0m_win[0xE000 + 8 * (t * 4 + oc / 8) + (oc % 8)];
+        for (int p = 0; p < 27; p++)
+            for (int q = 0; q < 27; q++) {
+                int64_t best = INT64_MIN;
+                for (int i = 0; i < 3; i++)
+                    for (int j = 0; j < 3; j++) {
+                        const int oh = 2 * p + i, ow = 2 * q + j;
+                        int64_t acc = bias;
+                        for (int kh = 0; kh < 3; kh++)
+                            for (int kw = 0; kw < 3; kw++) {
+                                const int ih = 2 * oh - 1 + kh, iw = 2 * ow - 1 + kw;
+                                if (ih >= 0 && ih < 112 && iw >= 0 && iw < 112)
+                                    acc += (int64_t)img[ih * 112 + iw] * w[kh * 3 + kw];
+                            }
+                        if (acc > best) best = acc;
+                    }
+                int64_t t = (best * mult + (1LL << 30)) >> 31;
+                if (shift > 0) t = (t + (1LL << (shift - 1))) >> shift;
+                if (t < -128) t = -128;
+                if (t > 127) t = 127;
+                if (t < amin) t = amin;
+                if (t > amax) t = amax;
+                c0m_win[0x4000 + (p * 27 + q) * 32 + oc] = (uint8_t)(int8_t)t;
+            }
+    }
+    c0m_cycles = 27243;     /* the RTL's count (xsim, Verilator, board) */
+    c0m_status = 2;
+}
+static void c0m_dma_go(uint64_t ctrl) {
+    const uint64_t ext = c0m_dma_ext, loc = c0m_dma_loc, len = c0m_dma_len;
+    if ((ext | loc | len) & 7 || len == 0 || loc + len > 0xF000) { c0m_dma_status = 2 | 4; return; }
+    if (ctrl & 2) memcpy((void *)(uintptr_t)ext, c0m_win + loc, len);
+    else memcpy(c0m_win + loc, (const void *)(uintptr_t)ext, len);
+    c0m_dma_cycles = len / 8;
+    c0m_dma_status = 2;
+}
+static inline void c0_w64(unsigned off, unsigned long long v) {
+    switch (off) {
+    case 0xF008: if (v & 1) c0m_engine(); return;
+#if !defined(MB_DRONET_CONV0_MODEL_NO_DMA)
+    case 0xF100: c0m_dma_ext = v; return;
+    case 0xF108: c0m_dma_loc = v; return;
+    case 0xF110: c0m_dma_len = v; return;
+    case 0xF118: if (v & 1) c0m_dma_go(v); return;
+#endif
+    default: memcpy(c0m_win + off, &v, 8);
+    }
+}
+static inline unsigned long long c0_r64(unsigned off) {
+    uint64_t v;
+    switch (off) {
+    case 0xF000: return 0x00000001434E5244ULL;
+    case 0xF008: return c0m_status;
+    case 0xF010: return c0m_cycles;
+#if !defined(MB_DRONET_CONV0_MODEL_NO_DMA)
+    case 0xF118: return c0m_dma_status;
+    case 0xF120: return c0m_dma_cycles;
+    case 0xF128: return 0x00000001414D4443ULL;
+#else
+    case 0xF128: return 0;
+#endif
+    default: memcpy(&v, c0m_win + off, 8); return v;
+    }
+}
+#define C0_FENCE() do { } while (0)
+#else
+/* ---------------- the device ---------------- */
+#define C0_BASE 0x11000000UL
+static inline void c0_w64(unsigned off, unsigned long long v) { *(volatile unsigned long long *)(C0_BASE + off) = v; }
+static inline unsigned long long c0_r64(unsigned off) { return *(volatile unsigned long long *)(C0_BASE + off); }
+#define C0_FENCE() __asm__ volatile("fence" ::: "memory")
+#endif
+
+/* Scalar NHWC conv + maxpool for everything the engine cannot take. HWIO weights
+ * (gemmini_q31_rvv packing: w[((kh*KW + kw)*IC + ic)*OC + oc]); requantize then pool,
+ * exactly as CONV2D_POOL_S8.reference_impl, out-of-bounds pool taps ignored. */
+static void c0_fallback(const int8_t *input, const int8_t *weight, const int32_t *bias, int8_t *output,
+                        int N, int IC, int IH, int IW, int OC, int KH, int KW, int SH, int SW, int PH, int PW,
+                        int in_off, int f_off, int out_off, int mult, int shift, int amin, int amax,
+                        int pKH, int pKW, int pSH, int pSW, int pPH, int pPW, int pDH, int pDW) {
+    const int OH = (IH + 2 * PH - KH) / SH + 1, OW = (IW + 2 * PW - KW) / SW + 1;
+    const int OHp = (OH + 2 * pPH - pDH * (pKH - 1) - 1) / pSH + 1;
+    const int OWp = (OW + 2 * pPW - pDW * (pKW - 1) - 1) / pSW + 1;
+    for (int n = 0; n < N; n++)
+        for (int ph = 0; ph < OHp; ph++)
+            for (int pw = 0; pw < OWp; pw++)
+                for (int oc = 0; oc < OC; oc++) {
+                    int8_t m = INT8_MIN;
+                    for (int i = 0; i < pKH; i++) {
+                        const int oh = ph * pSH - pPH + i * pDH;
+                        if (oh < 0 || oh >= OH) continue;
+                        for (int j = 0; j < pKW; j++) {
+                            const int ow = pw * pSW - pPW + j * pDW;
+                            if (ow < 0 || ow >= OW) continue;
+                            int32_t acc = bias ? bias[oc] : 0;
+                            for (int kh = 0; kh < KH; kh++) {
+                                const int ih = oh * SH - PH + kh;
+                                for (int kw = 0; kw < KW; kw++) {
+                                    const int iw = ow * SW - PW + kw;
+                                    for (int ic = 0; ic < IC; ic++) {
+                                        const int32_t x = (ih < 0 || ih >= IH || iw < 0 || iw >= IW) ? in_off
+                                            : (int32_t)input[(((size_t)n * IH + ih) * IW + iw) * IC + ic] + in_off;
+                                        acc += x * ((int32_t)weight[((kh * KW + kw) * IC + ic) * OC + oc] + f_off);
+                                    }
+                                }
+                            }
+                            int64_t prod = ((int64_t)acc * (int64_t)mult + (1LL << 30)) >> 31;
+                            int32_t v = (int32_t)prod;
+                            if (shift > 0) v = (int32_t)(((int64_t)v + ((int64_t)1 << (shift - 1))) >> shift);
+                            else if (shift < 0) v = v << (-shift);
+                            v += out_off;
+                            if (v < amin) v = amin;
+                            if (v > amax) v = amax;
+                            if ((int8_t)v > m) m = (int8_t)v;
+                        }
+                    }
+                    output[(((size_t)n * OHp + ph) * OWp + pw) * OC + oc] = m;
+                }
+}
+
+static const int8_t *c0_w_loaded;
+static const int32_t *c0_b_loaded;
+static unsigned long long c0_p_loaded;
+#if C0_USE_DMA
+static int c0_has_dma;
+#endif
+
+#if C0_USE_DMA
+/* One DMA transfer; 0 on success, -1 if the device flagged an argument error. */
+static int c0_dma(unsigned long ext, unsigned loc, unsigned len, int to_mem, unsigned long long *cyc) {
+    C0_FENCE();
+    c0_w64(0xF100, ext); c0_w64(0xF108, loc); c0_w64(0xF110, len);
+    c0_w64(0xF118, 1 | (to_mem ? 2 : 0));
+    while (!((c0_dma_status = c0_r64(0xF118)) & 2)) { }
+    *cyc = c0_r64(0xF120);
+    C0_FENCE();
+    return (c0_dma_status & 4) ? -1 : 0;
+}
+#endif
+
+void kernel_conv2d_pool_s8(const int8_t *input, const int8_t *weight,
+                           const int32_t *bias, int8_t *output,
+                           int N, int IC, int IH, int IW, int OC,
+                           int KH, int KW, int SH, int SW, int PH, int PW,
+                           int input_offset, int filter_offset, int output_offset,
+                           int output_multiplier, int output_shift,
+                           int activation_min, int activation_max,
+                           int pool_KH, int pool_KW, int pool_SH, int pool_SW,
+                           int pool_PH, int pool_PW, int pool_DH, int pool_DW) {
+    c0_calls++;
+    if (!(N == 1 && IC == 1 && IH == 112 && IW == 112 && OC == 32 && KH == 3 && KW == 3 &&
+          SH == 2 && SW == 2 && PH == 1 && PW == 1 && pool_KH == 3 && pool_KW == 3 &&
+          pool_SH == 2 && pool_SW == 2 && pool_PH == 0 && pool_PW == 0 && pool_DH == 1 && pool_DW == 1 &&
+          input_offset == 0 && filter_offset == 0 && output_offset == 0 && bias &&
+          output_multiplier > 0 && output_shift >= 0 && output_shift <= 31 &&
+          activation_min >= -128 && activation_max <= 127 && activation_min <= activation_max)) {
+        c0_fallbacks++;
+        c0_fallback(input, weight, bias, output, N, IC, IH, IW, OC, KH, KW, SH, SW, PH, PW,
+                    input_offset, filter_offset, output_offset, output_multiplier, output_shift,
+                    activation_min, activation_max, pool_KH, pool_KW, pool_SH, pool_SW,
+                    pool_PH, pool_PW, pool_DH, pool_DW);
+        return;
+    }
+    const unsigned long long prm = (unsigned long long)(uint32_t)output_multiplier |
+        ((unsigned long long)(output_shift & 31) << 32) |
+        ((unsigned long long)(uint8_t)activation_min << 40) | ((unsigned long long)(uint8_t)activation_max << 48);
+    if (weight != c0_w_loaded || bias != c0_b_loaded || prm != c0_p_loaded) {
+        /* First call (or new constants): weights, bias and requant parameters. */
+        c0_id = c0_r64(0xF000);
+#if C0_USE_DMA
+        c0_dma_id = c0_r64(0xF128);
+        c0_has_dma = c0_dma_id == 0x00000001414D4443ULL;
+#endif
+        for (int i = 0; i < 36; i++) {            /* HWIO with IC = 1: w[tap*32 + oc] */
+            unsigned long long v = 0;
+            for (int j = 0; j < 8; j++) v |= (unsigned long long)(uint8_t)weight[(i / 4) * 32 + (i % 4) * 8 + j] << (8 * j);
+            c0_w64(0xE000 + 8 * i, v);
+        }
+        for (int k = 0; k < 16; k++)
+            c0_w64(0xE200 + 8 * k, (unsigned long long)(uint32_t)bias[2 * k] | ((unsigned long long)(uint32_t)bias[2 * k + 1] << 32));
+        c0_w64(0xF018, prm);
+        c0_w_loaded = weight; c0_b_loaded = bias; c0_p_loaded = prm;
+    }
+#if C0_USE_DMA
+    if (c0_has_dma && c0_dma((unsigned long)input, 0x0000, 12544, 0, &c0_dma_in_cycles) == 0) {
+        c0_w64(0xF008, 1);
+        while (!(c0_r64(0xF008) & 2)) { }
+        c0_engine_cycles = c0_r64(0xF010);
+        if (c0_dma((unsigned long)output, 0x4000, 23328, 1, &c0_dma_out_cycles) == 0)
+            return;
+        /* misaligned output buffer: copy the result out over MMIO instead */
+        for (int i = 0; i < 2916; i++) { unsigned long long v = c0_r64(0x4000 + 8 * i); memcpy(output + 8 * i, &v, 8); }
+        return;
+    }
+#endif
+    for (int i = 0; i < 1568; i++) {
+        unsigned long long v; memcpy(&v, input + 8 * i, 8); c0_w64(8 * i, v);
+    }
+    c0_w64(0xF008, 1);
+    while (!(c0_r64(0xF008) & 2)) { }
+    c0_engine_cycles = c0_r64(0xF010);
+    for (int i = 0; i < 2916; i++) { unsigned long long v = c0_r64(0x4000 + 8 * i); memcpy(output + 8 * i, &v, 8); }
+}
